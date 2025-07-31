@@ -544,7 +544,7 @@ class SwinTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
                  embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
-                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
+                 num_features=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
                  norm_layer=partial(nn.LayerNorm, eps=1e-6), ape=False, patch_norm=True, 
                  return_all_tokens=False, use_mean_pooling=True, masked_im_modeling=False):
 
@@ -556,7 +556,7 @@ class SwinTransformer(nn.Module):
         self.embed_dim = embed_dim
         self.ape = ape
         self.patch_norm = patch_norm
-        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
+        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1)) if num_features is None else num_features
         self.mlp_ratio = mlp_ratio
         self.return_all_tokens = return_all_tokens
 
@@ -839,6 +839,46 @@ class SwinTransformer(nn.Module):
         x.permute(0, 2, 3, 1)[mask, :] = self.masked_embed.to(x.dtype)
 
         return x
+    
+class SwinTransformer2(SwinTransformer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        self.mlp1 = Mlp(in_features=self.embed_dim*2, hidden_features=self.embed_dim*8, out_features=self.num_features, drop=0.)
+        self.mlp2 = Mlp(in_features=self.embed_dim*4, hidden_features=self.embed_dim*16, out_features=self.num_features, drop=0.)
+        self.mlp3 = Mlp(in_features=self.embed_dim*8, hidden_features=self.embed_dim*32, out_features=self.num_features, drop=0.)
+        
+    def forward(self, x, return_all_tokens=None, mask=None):
+        # patch linear embedding
+        x = self.patch_embed(x)
+        # mask image modeling
+        if mask is not None:
+            x = self.mask_model(x, mask)
+        x = x.flatten(2).transpose(1, 2)
+
+        if self.ape:
+            x = x + self.absolute_pos_embed
+        x = self.pos_drop(x)
+
+        x_proj = []
+        x = self.layers[0](x)
+        x_proj.append(self.mlp1(x))
+        x = self.layers[1](x)
+        x_proj.append(self.mlp2(x))
+        x = self.layers[2](x)
+        x = self.layers[3](x)
+        x_proj.append(self.mlp3(x))
+
+        x_proj = torch.cat(x_proj, dim=1)
+        x_region = self.norm(x_proj)  # B L C
+        x = self.avgpool(x_region.transpose(1, 2))  # B C 1
+        x = torch.flatten(x, 1)
+
+        return_all_tokens = self.return_all_tokens if \
+            return_all_tokens is None else return_all_tokens
+        if return_all_tokens:
+            return torch.cat([x.unsqueeze(1), x_region], dim=1)
+        return x
 
 @register_model
 def swin_tiny(window_size=7, **kwargs):
@@ -866,4 +906,12 @@ def swin_large(window_size=7, **kwargs):
     model = SwinTransformer(
         window_size=window_size, embed_dim=192, depths=[2, 2, 18, 2], num_heads=[6, 12, 24, 48],
         mlp_ratio=4, qkv_bias=True, drop_path_rate=kwargs.pop('drop_path_rate', 0.2), **kwargs)
+    return model
+
+@register_model
+def swin_base2(window_size=7, **kwargs):
+    model = SwinTransformer2(
+        window_size=window_size, embed_dim=128, depths=[2, 2, 18, 2], num_heads=[4, 8, 16, 32],
+        mlp_ratio=4, qkv_bias=True, drop_path_rate=kwargs.pop('drop_path_rate', 0.2), 
+        num_features=128, **kwargs)
     return model

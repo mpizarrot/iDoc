@@ -34,7 +34,7 @@ def get_args_parser():
     # Model parameters
     parser.add_argument('--arch', default='vit_base', type=str,
         choices=['vit_tiny', 'vit_small', 'vit_base', 'vit_large', 'deit_tiny', 'deit_small',
-                 'swin_tiny','swin_small', 'swin_base', 'swin_large', 'vit_lora'],
+                 'swin_tiny','swin_small', 'swin_base', 'swin_large', 'vit_lora', 'swin_base2'],
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
     parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
@@ -553,7 +553,15 @@ class iBOTLoss(nn.Module):
             for v in range(len(student_cls_c)):
                 if v == q:
                     loss2 = torch.sum(-teacher_patch_c[q] * F.log_softmax(student_patch_c[v], dim=-1), dim=-1)
-                    mask = student_mask[v].flatten(-2, -1)
+                    if args.arch == 'swin_base2':
+                        s_mask = student_mask[v]
+                        mask = []
+                        mask.append(s_mask.repeat_interleave(4, -2).repeat_interleave(4, -1).flatten(-2, -1))
+                        mask.append(s_mask.repeat_interleave(2, -2).repeat_interleave(2, -1).flatten(-2, -1))
+                        mask.append(s_mask.flatten(-2, -1))
+                        mask = torch.cat(mask, dim=-1)
+                    else:
+                        mask = student_mask[v].flatten(-2, -1)
                     loss2 = torch.sum(loss2 * mask.float(), dim=-1) / mask.sum(dim=-1).clamp(min=1.0)
                     total_loss2 += loss2.mean()
                     n_loss_terms2 += 1
