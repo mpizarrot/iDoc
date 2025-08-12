@@ -318,7 +318,7 @@ def train_ibot(args):
     # for mixed precision training
     fp16_scaler = None
     if args.use_fp16:
-        fp16_scaler = torch.cuda.amp.GradScaler()
+        fp16_scaler = torch.amp.GradScaler()
 
     # ============ init schedulers ... ============
     lr_schedule = utils.cosine_scheduler(
@@ -420,7 +420,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
         images = [im.cuda(non_blocking=True) for im in images]
         masks = [msk.cuda(non_blocking=True) for msk in masks]        
         
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             # get global views
             teacher_output = teacher(images[:args.global_crops_number])
             student_output = student(images[:args.global_crops_number], mask=masks[:args.global_crops_number])

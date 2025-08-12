@@ -6,8 +6,8 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from loaders.dataset_docexplore_eval import DocExploreEval, DocExploreQueries
-from models.vision_transformer import vit_base
-from models.vit_lora import vit_lora
+from models.swin_transformer import swin_base2
+#from models.vit_lora import vit_lora
 
 from tqdm import tqdm
 
@@ -22,21 +22,21 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Ver si se esta aplicando padding a las imágenes
-    image_dataset = DocExploreEval("/home/data/cstears/dataframes/dets_thr-01_df.pkl", transform=dataset_transforms)
-    cataloges_dataset = DocExploreQueries("/home/mpizarro/iDoc/loaders/docexplore_photos_list.txt", transform=dataset_transforms)
+    image_dataset = DocExploreEval("/home/shared_data/Datasets/DocExplore/dets_thr-01_df.pkl", transform=dataset_transforms)
+    cataloges_dataset = DocExploreQueries("./loaders/docexplore_photos_list.txt", transform=dataset_transforms)
 
     image_loader = DataLoader(dataset=image_dataset, batch_size=64, num_workers=12, shuffle=False)
     cataloges_loader = DataLoader(dataset=cataloges_dataset, batch_size=64, num_workers=12, shuffle=False)
 
-    path_results = 'results/'
+    path_results = '/home/mpizarro/Pattern_Spotting/results/iDoc2/'
     if not os.path.exists(path_results):
         os.makedirs(path_results)
 
-    model = vit_lora().to(device)
+    model = swin_base2().to(device)
     #vit_base().to(device) 
     #torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg').to(device)
     
-    model_checkpoint = torch.load("/home/mpizarro/out/mix_ibot_lora/teacher.pth", map_location=device, weights_only=False)
+    model_checkpoint = torch.load("/home/mpizarro/Pattern_Spotting/out/iDoc2/teacher40.pth", map_location=device, weights_only=False)
     model.load_state_dict(model_checkpoint['state_dict'])                
     model.eval()                                                         
     
@@ -46,7 +46,7 @@ if __name__ == '__main__':
     catalog_labels = []
     catalog_paths = []
     top_k = len(image_dataset)
-    archivo_salida = path_results + "lora"
+    archivo_salida = path_results + "swin2_40"
 
     with torch.no_grad():
         for (catalog, s_label, path) in tqdm(cataloges_loader):
