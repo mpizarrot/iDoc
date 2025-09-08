@@ -546,7 +546,7 @@ class SwinTransformer(nn.Module):
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  num_features=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
                  norm_layer=partial(nn.LayerNorm, eps=1e-6), ape=False, patch_norm=True, 
-                 return_all_tokens=False, use_mean_pooling=True, masked_im_modeling=False):
+                 return_all_tokens=False, masked_im_modeling=False):
 
         super().__init__()
 
@@ -840,6 +840,45 @@ class SwinTransformer(nn.Module):
 
         return x
     
+class MultiScaleCLS(nn.Module):
+    """
+    Un CLS global por cross-attention sobre tokens multiescala.
+    """
+    def __init__(self, dim, num_heads=8, num_scales=3):
+        super().__init__()
+        self.num_scales = num_scales
+        self.cls = nn.Parameter(torch.randn(1, 1, dim))          # [1, 1, C]
+        self.level_embed = nn.Parameter(torch.randn(num_scales, dim))  # [S, C]
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
+        self.cls_mlp = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, 4*dim),
+            nn.GELU(),
+            nn.Linear(4*dim, dim),
+        )
+
+    def forward(self, feats):
+        """
+        feats: lista [X1, X2, X3], cada Xi: [B, Li, C] ya proyectados al mismo C.
+        return:
+            out: [B, 1 + sum(Li), C] = [CLS, X1, X2, X3]
+        """
+        # Tokens con marca de escala para keys/values del cross-attention
+        xs_attn = []
+        for i, Xi in enumerate(feats):
+            xs_attn.append(Xi + self.level_embed[i].view(1, 1, -1))     # [B, Li, C]
+        X_keys = torch.cat(xs_attn, dim=1)                               # [B, L_total, C]
+
+        B = X_keys.size(0)
+        cls = self.cls.expand(B, -1, -1)                                # [B, 1, C]
+
+        # queries = cls, keys/values = X_keys (con level_embed)
+        cls_out, _ = self.attn(cls, X_keys, X_keys, need_weights=False) # [B, 1, C]
+        cls_out = self.cls_mlp(cls_out)                                  # [B, 1, C]
+
+        # Devolvemos CLS + tokens sin level_embed
+        return torch.cat([cls_out, X_keys], dim=1)                      # [B, 1+L_total, C]
+    
 class SwinTransformer2(SwinTransformer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -847,6 +886,8 @@ class SwinTransformer2(SwinTransformer):
         self.mlp1 = Mlp(in_features=self.embed_dim*2, hidden_features=self.embed_dim*8, out_features=self.num_features, drop=0.)
         self.mlp2 = Mlp(in_features=self.embed_dim*4, hidden_features=self.embed_dim*16, out_features=self.num_features, drop=0.)
         self.mlp3 = Mlp(in_features=self.embed_dim*8, hidden_features=self.embed_dim*32, out_features=self.num_features, drop=0.)
+        
+        self.ms_cls = MultiScaleCLS(dim=self.num_features, num_heads=8, num_scales=3)
         
     def forward(self, x, return_all_tokens=None, mask=None):
         # patch linear embedding
@@ -859,26 +900,25 @@ class SwinTransformer2(SwinTransformer):
         if self.ape:
             x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
-
-        x_proj = []
-        x = self.layers[0](x)
-        x_proj.append(self.mlp1(x))
-        x = self.layers[1](x)
-        x_proj.append(self.mlp2(x))
+        x = self.layers[0](x)     # salida escala 1
+        f1 = self.mlp1(x)         # [B, L1, C]
+        x = self.layers[1](x)     # salida escala 2
+        f2 = self.mlp2(x)         # [B, L2, C]
         x = self.layers[2](x)
-        x = self.layers[3](x)
-        x_proj.append(self.mlp3(x))
+        x = self.layers[3](x)     # salida escala 3
+        f3 = self.mlp3(x)         # [B, L3, C]
 
-        x_proj = torch.cat(x_proj, dim=1)
-        x_region = self.norm(x_proj)  # B L C
-        x = self.avgpool(x_region.transpose(1, 2))  # B C 1
-        x = torch.flatten(x, 1)
-
+        out = self.ms_cls([f1, f2, f3])  # [B, 1+L1+L2+L3, C]
+        cls  = out[:, :1, :]          # [B,1,C]
+        toks = out[:, 1:, :]          # [B,L1+L2+L3,C]
+        cls  = self.norm(cls)
+        toks = self.norm(toks)
+        
         return_all_tokens = self.return_all_tokens if \
             return_all_tokens is None else return_all_tokens
         if return_all_tokens:
-            return torch.cat([x.unsqueeze(1), x_region], dim=1)
-        return x
+            return torch.cat([cls, toks], dim=1)
+        return cls.squeeze(1)
 
 @register_model
 def swin_tiny(window_size=7, **kwargs):

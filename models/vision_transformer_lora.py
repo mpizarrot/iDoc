@@ -3,10 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import math
-from typing import List
 
-from .vision_transformer import vit_base
-from .vision_transformer import Attention
+from models.vision_transformer import vit_base
+from models.vision_transformer import Attention
+from dinov3.models.vision_transformer import vit_base as dinov3_vit_base
 
 class LoRALayer():
     def __init__(
@@ -341,7 +341,7 @@ def apply_lora(model, params=['q', 'k', 'v'], r=64, alpha=1, dropout_rate=0.25):
     indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     vision_encoder = model
     for i, block in enumerate(vision_encoder.blocks):
-        print(f"Residual Attention Block {i}: {block}")
+        #print(f"Residual Attention Block {i}: {block}")
         if i in indices:
             for name, submodule in block.named_children():
                 if isinstance(submodule, Attention):
@@ -375,6 +375,30 @@ def vit_lora(ckpt_path=None, **kwargs):
     if ckpt_path is not None:
         model_checkpoint = torch.load(ckpt_path)
         model.load_state_dict(model_checkpoint['state_dict'])
+    apply_lora(model)
+    print("LoRA applied")
+    model.apply(lora_trainable)
+    return model
+
+def dinov3_lora(ckpt_path=None, **kwargs):
+    model = dinov3_vit_base(img_size=224,
+        in_chans=3,
+        pos_embed_rope_base=100,
+        pos_embed_rope_normalize_coords="separate",
+        pos_embed_rope_rescale_coords=2,
+        pos_embed_rope_dtype="fp32",
+        qkv_bias=True,
+        layerscale_init=1.0e-05,
+        norm_layer="layernormbf16",
+        ffn_layer="mlp",
+        ffn_bias=True,
+        proj_bias=True,
+        n_storage_tokens=4,
+        mask_k_bias=True,
+        **kwargs)
+    if ckpt_path is not None:
+        model_checkpoint = torch.load(ckpt_path, weights_only=False)
+        model.load_state_dict(model_checkpoint)
     apply_lora(model)
     print("LoRA applied")
     model.apply(lora_trainable)

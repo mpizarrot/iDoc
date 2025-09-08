@@ -26,7 +26,6 @@ from torchvision import models as torchvision_models
 from tensorboardX import SummaryWriter
 from models.head import iBOTHead
 from loaders.docs_dataset import HistoricalDocFolderMask
-from models.vit_lora import vit_lora
 
 def get_args_parser():
     parser = argparse.ArgumentParser('iBOT', add_help=False)
@@ -34,7 +33,8 @@ def get_args_parser():
     # Model parameters
     parser.add_argument('--arch', default='vit_base', type=str,
         choices=['vit_tiny', 'vit_small', 'vit_base', 'vit_large', 'deit_tiny', 'deit_small',
-                 'swin_tiny','swin_small', 'swin_base', 'swin_large', 'vit_lora', 'swin_base2'],
+                 'swin_tiny','swin_small', 'swin_base', 'swin_large', 'vit_lora', 'swin_base2',
+                 'swin_base3', 'dinov3_lora'],
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
     parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
@@ -147,10 +147,10 @@ def get_args_parser():
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
-    parser.add_argument('--ckpt_path_student', default="/home/mpizarro/data/ibot_pretrained_student.pth", type=str, help='Path to pretrained student (only for LoRA)')
-    parser.add_argument('--ckpt_path_teacher', default="/home/mpizarro/data/ibot_pretrained_teacher.pth", type=str, help='Path to pretrained teacher (only for LoRA)')
+    parser.add_argument('--ckpt_path_student', default=None, type=str, help='Path to pretrained student (only for LoRA)')
+    parser.add_argument('--ckpt_path_teacher', default=None, type=str, help='Path to pretrained teacher (only for LoRA)')
     parser.add_argument('--old_path', default="/media/chr/Datasets/HORAE/imgs/", type=str, help='Old path where the data was located')
-    parser.add_argument('--new_path', default="/home/data/cstears/horae/imgs/", type=str, help='New path where the data is located')
+    parser.add_argument('--new_path', default="/home/shared_data/HORAE/imgs/", type=str, help='New path where the data is located')
     return parser
 
 def train_ibot(args):
@@ -193,16 +193,15 @@ def train_ibot(args):
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
     args.arch = args.arch.replace("deit", "vit")
-    # if the network is of hierechical features (i.e. swin_tiny, swin_small, swin_base)
-    if args.arch == "vit_lora":
-        student = vit_lora(
+    if args.arch in models.__dict__.keys() and 'lora' in args.arch:
+        student = models.__dict__[args.arch](
             ckpt_path=args.ckpt_path_student,
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path,
             return_all_tokens=True,
             masked_im_modeling=args.use_masked_im_modeling,
         )
-        teacher = vit_lora(
+        teacher = models.__dict__[args.arch](
             ckpt_path=args.ckpt_path_teacher,
             patch_size=args.patch_size,
             return_all_tokens=True,
@@ -553,17 +552,50 @@ class iBOTLoss(nn.Module):
             for v in range(len(student_cls_c)):
                 if v == q:
                     loss2 = torch.sum(-teacher_patch_c[q] * F.log_softmax(student_patch_c[v], dim=-1), dim=-1)
+                #     mask = student_mask[v].flatten(-2, -1)
+                #     loss2 = torch.sum(loss2 * mask.float(), dim=-1) / mask.sum(dim=-1).clamp(min=1.0)
+                #     total_loss2 += loss2.mean()
+                #     n_loss_terms2 += 1
+                # else:
+                #     loss1 = torch.sum(-teacher_cls_c[q] * F.log_softmax(student_cls_c[v], dim=-1), dim=-1)
+                #     total_loss1 += loss1.mean()
+                #     n_loss_terms1 += 1
                     if args.arch == 'swin_base2':
                         s_mask = student_mask[v]
-                        mask = []
-                        mask.append(s_mask.repeat_interleave(4, -2).repeat_interleave(4, -1).flatten(-2, -1))
-                        mask.append(s_mask.repeat_interleave(2, -2).repeat_interleave(2, -1).flatten(-2, -1))
-                        mask.append(s_mask.flatten(-2, -1))
-                        mask = torch.cat(mask, dim=-1)
+                        _, H3, W3 = s_mask.shape
+                        L3 = H3 * W3
+                        L2 = 4 * L3
+                        L_total = loss2.shape[-1]
+                        L1 = L_total - (L2 + L3)
+                        # máscaras por escala
+                        m1 = s_mask.repeat_interleave(4, -2).repeat_interleave(4, -1).flatten(-2, -1)  # [B, L1]
+                        m2 = s_mask.repeat_interleave(2, -2).repeat_interleave(2, -1).flatten(-2, -1)  # [B, L2]
+                        m3 = s_mask.flatten(-2, -1) # [B, L3]
+                        # split por escala
+                        l1_tok = loss2[:, 0:L1]     # [B, L1]
+                        l2_tok = loss2[:, L1:L1+L2] # [B, L2]
+                        l3_tok = loss2[:, L1+L2:]   # [B, L3]
+                        # promedio dentro de cada escala (solo tokens enmascarados)
+                        loss_f1 = (l1_tok * m1.float()).sum(dim=-1) / m1.sum(dim=-1).clamp(min=1.0)   # [B]
+                        loss_f2 = (l2_tok * m2.float()).sum(dim=-1) / m2.sum(dim=-1).clamp(min=1.0)   # [B]
+                        loss_f3 = (l3_tok * m3.float()).sum(dim=-1) / m3.sum(dim=-1).clamp(min=1.0)   # [B]
+                        # ponderar por #parches enmascarados de cada escala
+                        n1 = m1.sum(dim=-1)   # [B]
+                        n2 = m2.sum(dim=-1)
+                        n3 = m3.sum(dim=-1)
+                        nsum = (n1 + n2 + n3).clamp(min=1.0)
+                        # pesos por batch
+                        w1 = (n1 / nsum)
+                        w2 = (n2 / nsum)
+                        w3 = (n3 / nsum)
+                        # combinar por escala y promediar en el batch
+                        loss2 = (w1 * loss_f1 + w2 * loss_f2 + w3 * loss_f3).mean()
                     else:
                         mask = student_mask[v].flatten(-2, -1)
-                    loss2 = torch.sum(loss2 * mask.float(), dim=-1) / mask.sum(dim=-1).clamp(min=1.0)
-                    total_loss2 += loss2.mean()
+                        loss2 = torch.sum(loss2 * mask.float(), dim=-1) / mask.sum(dim=-1).clamp(min=1.0)
+                        loss2 = loss2.mean()
+                        
+                    total_loss2 += loss2
                     n_loss_terms2 += 1
                 else:
                     loss1 = torch.sum(-teacher_cls_c[q] * F.log_softmax(student_cls_c[v], dim=-1), dim=-1)

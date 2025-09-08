@@ -33,7 +33,7 @@ class DocExploreEval(Dataset):
         x1, y1, x2, y2 = map(int, [df_idx['x1'], df_idx['y1'], df_idx['x2'], df_idx['y2']])
         return img.crop((x1, y1, x2, y2))
     
-    def change_path(self, new_path_docexplore='/home/data/cstears/'):
+    def change_path(self, new_path_docexplore='/home/data/Datasets/DocExplore/'):
         self.df_docexplore['filename'] = self.df_docexplore['filename'].apply(lambda x: x.replace(
             '/home/cloyola/datasets/DocExplore/', new_path_docexplore))
         self.df_docexplore['filename'] = self.df_docexplore['filename'].apply(lambda x: x.replace(

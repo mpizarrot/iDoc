@@ -6,8 +6,9 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from loaders.dataset_docexplore_eval import DocExploreEval, DocExploreQueries
-from models.swin_transformer import swin_base2
-#from models.vit_lora import vit_lora
+from models.vision_transformer_lora import vit_lora
+# from models.swin_transformer import swin_base2, swin_base
+# from models.vision_transformer import vit_base
 
 from tqdm import tqdm
 
@@ -22,21 +23,21 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Ver si se esta aplicando padding a las imágenes
-    image_dataset = DocExploreEval("/home/shared_data/Datasets/DocExplore/dets_thr-01_df.pkl", transform=dataset_transforms)
+    image_dataset = DocExploreEval("/home/data/Datasets/DocExplore/dets_thr-01_df.pkl", transform=dataset_transforms)
     cataloges_dataset = DocExploreQueries("./loaders/docexplore_photos_list.txt", transform=dataset_transforms)
 
     image_loader = DataLoader(dataset=image_dataset, batch_size=64, num_workers=12, shuffle=False)
     cataloges_loader = DataLoader(dataset=cataloges_dataset, batch_size=64, num_workers=12, shuffle=False)
 
-    path_results = '/home/mpizarro/Pattern_Spotting/results/iDoc2/'
+    path_results = '/home/mpizarro/out/vit_lora/results/'
     if not os.path.exists(path_results):
         os.makedirs(path_results)
 
-    model = swin_base2().to(device)
-    #vit_base().to(device) 
+    model = vit_lora().to(device)
+    #model = torch.hub.load("/home/mpizarro/repos/dinov3", 'dinov3_vitb16', source='local', weights="/home/mpizarro/data/dinov3_vitb16_pretrain.pth").to(device)
     #torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg').to(device)
     
-    model_checkpoint = torch.load("/home/mpizarro/Pattern_Spotting/out/iDoc2/teacher40.pth", map_location=device, weights_only=False)
+    model_checkpoint = torch.load("/home/mpizarro/out/vit_lora/teacher.pth", map_location=device, weights_only=False)
     model.load_state_dict(model_checkpoint['state_dict'])                
     model.eval()                                                         
     
@@ -46,7 +47,7 @@ if __name__ == '__main__':
     catalog_labels = []
     catalog_paths = []
     top_k = len(image_dataset)
-    archivo_salida = path_results + "swin2_40"
+    archivo_salida = path_results
 
     with torch.no_grad():
         for (catalog, s_label, path) in tqdm(cataloges_loader):
@@ -105,7 +106,7 @@ if __name__ == '__main__':
 
         for size in [1000]:
             print(f"Guardando los resultados de los primeros {size} rankings")
-            with open(archivo_salida + "_" + str(size) + ".txt", "w") as f:
+            with open(archivo_salida + str(size) + ".txt", "w") as f:
                 for i in range(len(catalog_labels)):
                     max_label_row = max_labels[i][all_query_distance[i][max_indices[i]] >= 0][:size]
                     max_bbox_row = max_bbox[i][all_query_distance[i][max_indices[i]] >= 0][:size]
@@ -121,7 +122,7 @@ if __name__ == '__main__':
                     f.write(f"{path_image}:{final_str}\r\n")
             
             print(f"Guardando los scores de los primeros {size} rankings")
-            with open(archivo_salida + "_scores.txt", "w") as f:
+            with open(archivo_salida + "scores.txt", "w") as f:
                 for i in range(len(catalog_labels)):
                     max_values_row = max_values[i]
                     path_image = catalog_paths[i].split("/")[-1].split(".")[0]
@@ -134,7 +135,7 @@ if __name__ == '__main__':
                     f.write(f"{path_image}:{final_str}\r\n")
                 
 
-        with open(archivo_salida + "_images.txt", "w") as f:
+        with open(archivo_salida + "images.txt", "w") as f:
             for i in range(len(catalog_paths)):
                 catalog_label = catalog_labels[i]
                 catalog_path = catalog_paths[i]

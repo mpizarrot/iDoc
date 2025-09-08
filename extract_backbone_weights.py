@@ -14,7 +14,7 @@ def parse_args():
     parser.add_argument('checkpoint', help='checkpoint file')
     parser.add_argument(
         'output', type=str, help='destination file name')
-    parser.add_argument("--checkpoint_key", default="state_dict", type=str, help='Key to use in the checkpoint (example: "teacher")')
+    parser.add_argument("--checkpoint_key", default="teacher", type=str, help='Key to use in the checkpoint (example: "teacher")')
     parser.add_argument("--with_head", type=utils.bool_flag, default=False, help='extract checkpoints w/ or w/o head")')
     args = parser.parse_args()
     return args
