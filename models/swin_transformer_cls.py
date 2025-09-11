@@ -122,18 +122,15 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, mask=None, cls_win=None):
+    def forward(self, x, cls_win, mask=None):
         """
         x: (nW*B, N, C) tokens de ventana
+        cls_win: (nW*B, 1, C) token CLS por ventana
         mask: (nW, N, N) o None
-        cls_win: (nW*B, 1, C) o None  -> token CLS por ventana
         """
         B_, N, C = x.shape
-        if cls_win is not None:
-            x = torch.cat([x, cls_win], dim=1)  # (nW*B, N+1, C)
-            N_all = N + 1
-        else:
-            N_all = N
+        x = torch.cat([x, cls_win], dim=1)  # (nW*B, N+1, C)
+        N_all = N + 1
         qkv = self.qkv(x).reshape(B_, N_all, 3, self.num_heads, C // self.num_heads).permute(2,0,3,1,4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
@@ -162,11 +159,8 @@ class WindowAttention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         
-        if cls_win is not None:
-            x_tokens, x_cls = x[:, :N, :], x[:, N:, :]  # (nW*B, N, C), (nW*B, 1, C)
-            return x_tokens, x_cls, attn_out
-        else:
-            return x, None, attn_out
+        x_tokens, x_cls = x[:, :N, :], x[:, N:, :]  # (nW*B, N, C), (nW*B, 1, C)
+        return x_tokens, x_cls, attn_out
 
     def extra_repr(self) -> str:
         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
@@ -240,13 +234,15 @@ class SwinTransformerBlock(nn.Module):
         self.W = input_resolution[1]
 
         self.attn_mask_dict = {} # {self.H: self.create_attn_mask(self.H, self.W)}
-        self.cls_q = nn.Linear(dim, dim, bias=True)
-        self.cls_k = nn.Linear(dim, dim, bias=True)
-        self.cls_v = nn.Linear(dim, dim, bias=True)
-        self.cls_ln = norm_layer(dim)
-        self.cls_mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), out_features=dim, act_layer=act_layer, drop=drop)
-        # LayerScale pequeño para estabilidad (residual en stage_cls)
-        self.cls_gamma = nn.Parameter(torch.ones(1, 1, dim) * 1e-3)
+        if self.shift_size > 0:
+            # solo para SW-MSA
+            self.cls_ln = norm_layer(dim)
+            self.cls_tau = nn.Parameter(torch.tensor(1.0))
+            self.cls_gamma = nn.Parameter(torch.ones(1,1,dim) * 1e-3)
+        else:
+            self.cls_ln = None
+            self.cls_tau = None
+            self.cls_gamma = None
 
     def create_attn_mask(self, H, W):
         # calculate attention mask for SW-MSA
@@ -274,7 +270,7 @@ class SwinTransformerBlock(nn.Module):
         return attn_mask
 
 
-    def forward(self, x, stage_cls=None):
+    def forward(self, x, stage_cls):
         """
         x: (B, L, C)
         stage_cls: (B, 1, C) o None
@@ -312,15 +308,12 @@ class SwinTransformerBlock(nn.Module):
         x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
-        if stage_cls is not None:
-            # stage_cls: (B,1,C) -> repetir por #ventanas por imagen
-            nW = (Hp // self.window_size) * (Wp // self.window_size)
-            cls_win = stage_cls.repeat_interleave(nW, dim=0)  # (nW*B, 1, C)
-        else:
-            cls_win = None
+        # stage_cls: (B,1,C) -> repetir por #ventanas por imagen
+        nW = (Hp // self.window_size) * (Wp // self.window_size)
+        cls_win = stage_cls.repeat_interleave(nW, dim=0)  # (nW*B, 1, C)
             
         # W-MSA/SW-MSA
-        attn_windows, cls_out, _ = self.attn(x_windows, attn_mask, cls_win)  # nW*B, window_size*window_size, C
+        attn_windows, cls_out, _ = self.attn(x_windows, cls_win, attn_mask)  # nW*B, window_size*window_size, C
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -341,32 +334,19 @@ class SwinTransformerBlock(nn.Module):
         x = shortcut + self.drop_path(x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
-        # Agregación de CLS de ventanas mediante ATTENTION POOLING consultado por stage_cls
-        if stage_cls is not None and cls_out is not None:
-            # cls_out: (nW*B, 1, C) -> (B, nW, C)
-            nW = (Hp // self.window_size) * (Wp // self.window_size)
-            cls_win = cls_out.view(B, nW, C)
-
-            # Proyecciones
-            q = self.cls_q(stage_cls)                 # (B, 1, C)
-            k = self.cls_k(cls_win)                   # (B, nW, C)
-            v = self.cls_v(cls_win)                   # (B, nW, C)
-
-            # Atencion: (B, 1, nW)
-            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / sqrt(C)
-            attn_weights = attn_scores.softmax(dim=-1)
-
-            # Pooling: (B, 1, C)
-            pooled = torch.matmul(attn_weights, v)
-
-            # Update residual del stage_cls (LayerNorm + MLP + LayerScale)
-            stage_cls = stage_cls + self.cls_gamma * self.cls_mlp(self.cls_ln(pooled))
-
+        # Agregación de CLS de ventanas mediante ATTENTION POOLING
+        if self.shift_size > 0:
+            cls_win = cls_out.view(B, nW, C)                   # (B, nW, C)
+            q = self.cls_ln(stage_cls)                         # (B,1,C)
+            k = self.cls_ln(cls_win)                           # (B,nW,C)
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.cls_tau * sqrt(C))  # (B,1,nW)
+            attn_weights = attn_scores.softmax(dim=-1)                                     # (B,1,nW)
+            pooled = torch.matmul(attn_weights, cls_win)       # (B,1,C)  (v = identidad)
+            stage_cls = stage_cls + self.cls_gamma * pooled    # residual con layerscale
             cls_out = stage_cls
-
-        elif cls_out is not None:
+        else:
             nW = (Hp // self.window_size) * (Wp // self.window_size)
-            cls_out = cls_out.view(B, nW, 1, C).mean(dim=1)  # (B,1,C)
+            cls_out = cls_out.view(B, nW, 1, C).mean(dim=1)    # fallback
 
         return x, cls_out
 
@@ -492,11 +472,14 @@ class BasicLayer(nn.Module):
     def forward(self, x, stage_cls=None):
         for blk in self.blocks:
             x, stage_cls = blk(x, stage_cls=stage_cls)
+            
+        pre_cls = stage_cls
+        
         if self.downsample is not None:
             x = self.downsample(x)
             if stage_cls is not None:
                 stage_cls = self.cls_down(stage_cls)  # (B,1,dim*2)
-        return x, stage_cls
+        return x, stage_cls, pre_cls
 
     def forward_with_features(self, x, stage_cls=None):
         fea = []
@@ -566,7 +549,7 @@ class PatchEmbed(nn.Module):
         return flops
 
 
-class SwinTransformer(nn.Module):
+class SwinTransformerCLS(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
           https://arxiv.org/pdf/2103.14030
@@ -647,11 +630,12 @@ class SwinTransformer(nn.Module):
         for p in self.stage_cls_tokens:
             trunc_normal_(p, std=.02)
 
-        # mezclador para CLS final (concat de todos los stages)
         self.cls_fuse = nn.Sequential(
             nn.LayerNorm(sum(int(embed_dim * 2 ** i) for i in range(self.num_layers))),
             nn.Linear(sum(int(embed_dim * 2 ** i) for i in range(self.num_layers)), self.num_features),
         )
+        
+        self.cls_alpha = nn.Parameter(torch.zeros(self.num_layers))
         
         self.norm = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
@@ -695,16 +679,30 @@ class SwinTransformer(nn.Module):
         x = self.pos_drop(x)
 
         B = x.shape[0]
-        collected_stage_cls = []
+        collected_pre_cls = []
+        prev_cls = None
 
-        # recorre stages con su CLS propio
         for i, layer in enumerate(self.layers):
-            stage_cls = self.stage_cls_tokens[i].expand(B, -1, -1).to(x.dtype).to(x.device)  # (B,1,dim_i)
-            x, stage_cls = layer(x, stage_cls=stage_cls)  # stage_cls actualizado
-            collected_stage_cls.append(stage_cls)  # (B,1,dim_i)
+            seed = self.stage_cls_tokens[i].expand(B, 1, -1).to(x.dtype).to(x.device)  # (B,1,dim_i)
+
+            # construir stage_cls de entrada
+            if i == 0 or prev_cls is None:
+                stage_cls_in = seed
+            else:
+                g = torch.sigmoid(self.cls_alpha[i]).view(1,1,1)  # escalar en [0,1]
+                p = F.layer_norm(prev_cls, (prev_cls.shape[-1],), eps=1e-6)  # (B,1,D_i)
+                s = F.layer_norm(seed,     (seed.shape[-1],),     eps=1e-6)
+                stage_cls_in = g * p + (1 - g) * s                # (B,1,D_i)
+
+            # forward del stage pidiendo pre_cls
+            x, stage_cls_out, pre_cls = layer(x, stage_cls_in)
+            collected_pre_cls.append(pre_cls)   # para cls_fuse al final
+
+            # preparar prev_cls para el SIGUIENTE stage
+            prev_cls = stage_cls_out            # (B,1,dim_{i+1} o None en el último)
 
         # CLS final compuesto
-        cls_concat = torch.cat([c.squeeze(1) for c in collected_stage_cls], dim=-1)  # (B, sum_dims)
+        cls_concat = torch.cat([c.squeeze(1) for c in collected_pre_cls], dim=-1)  # (B, sum_dims)
         cls_final = self.cls_fuse(cls_concat)  # (B, num_features)
 
         x_region = self.norm(x)  # B L C
@@ -712,7 +710,7 @@ class SwinTransformer(nn.Module):
         return_all_tokens = self.return_all_tokens if \
             return_all_tokens is None else return_all_tokens
         if return_all_tokens:
-            return torch.cat([cls_final, x_region], dim=1)
+            return torch.cat([cls_final.unsqueeze(1), x_region], dim=1)
         return cls_final
 
     def get_selfattention(self, x, n=1):
@@ -914,28 +912,28 @@ class SwinTransformer(nn.Module):
 
 @register_model
 def swin_tiny_cls(window_size=7, **kwargs):
-    model = SwinTransformer(
+    model = SwinTransformerCLS(
         window_size=window_size, embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
         mlp_ratio=4, qkv_bias=True, drop_path_rate=kwargs.pop('drop_path_rate', 0.1), **kwargs)
     return model
 
 @register_model
 def swin_small_cls(window_size=7, **kwargs):
-    model = SwinTransformer(
+    model = SwinTransformerCLS(
         window_size=window_size, embed_dim=96, depths=[2, 2, 18, 2], num_heads=[3, 6, 12, 24],
         mlp_ratio=4, qkv_bias=True, drop_path_rate=kwargs.pop('drop_path_rate', 0.2), **kwargs)
     return model
 
 @register_model
 def swin_base_cls(window_size=7, **kwargs):
-    model = SwinTransformer(
+    model = SwinTransformerCLS(
         window_size=window_size, embed_dim=128, depths=[2, 2, 18, 2], num_heads=[4, 8, 16, 32],
         mlp_ratio=4, qkv_bias=True, drop_path_rate=kwargs.pop('drop_path_rate', 0.2), **kwargs)
     return model
 
 @register_model
 def swin_large_cls(window_size=7, **kwargs):
-    model = SwinTransformer(
+    model = SwinTransformerCLS(
         window_size=window_size, embed_dim=192, depths=[2, 2, 18, 2], num_heads=[6, 12, 24, 48],
         mlp_ratio=4, qkv_bias=True, drop_path_rate=kwargs.pop('drop_path_rate', 0.2), **kwargs)
     return model

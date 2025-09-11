@@ -33,7 +33,7 @@ def get_args_parser():
     # Model parameters
     parser.add_argument('--arch', default='vit_base', type=str,
         choices=['vit_tiny', 'vit_small', 'vit_base', 'vit_large', 'deit_tiny', 'deit_small',
-                 'swin_tiny','swin_small', 'swin_base', 'swin_large', 'vit_lora', 'swin_base2',
+                 'swin_tiny','swin_small', 'swin_base', 'swin_large', 'vit_lora', 'swin_base_cls',
                  'swin_base3', 'dinov3_lora'],
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
