@@ -237,11 +237,13 @@ class SwinTransformerBlock(nn.Module):
         if self.shift_size > 0:
             # solo para SW-MSA
             self.cls_ln = norm_layer(dim)
-            self.cls_tau = nn.Parameter(torch.tensor(1.0))
-            self.cls_gamma = nn.Parameter(torch.ones(1,1,dim) * 1e-3)
+            self.log_tau = nn.Parameter(torch.zeros(()))
+            self.tau_min = 1e-2 
+            self.tau_max = 10.0
+            self.cls_gamma = nn.Parameter(torch.ones(1,1,dim) * 5e-4)
         else:
             self.cls_ln = None
-            self.cls_tau = None
+            self.log_tau = None
             self.cls_gamma = None
 
     def create_attn_mask(self, H, W):
@@ -339,9 +341,12 @@ class SwinTransformerBlock(nn.Module):
             cls_win = cls_out.view(B, nW, C)                   # (B, nW, C)
             q = self.cls_ln(stage_cls)                         # (B,1,C)
             k = self.cls_ln(cls_win)                           # (B,nW,C)
-            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.cls_tau * sqrt(C))  # (B,1,nW)
+            tau = self.tau_min + (self.tau_max - self.tau_min) * torch.sigmoid(self.log_tau)
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (tau * sqrt(C)) # (B,1,nW)
+            attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True)[0] # estabilizar
             attn_weights = attn_scores.softmax(dim=-1)                                     # (B,1,nW)
             pooled = torch.matmul(attn_weights, cls_win)       # (B,1,C)  (v = identidad)
+            pooled = F.layer_norm(pooled, (C,), eps=1e-5)
             stage_cls = stage_cls + self.cls_gamma * pooled    # residual con layerscale
             cls_out = stage_cls
         else:
@@ -690,8 +695,9 @@ class SwinTransformerCLS(nn.Module):
                 stage_cls_in = seed
             else:
                 g = torch.sigmoid(self.cls_alpha[i]).view(1,1,1)  # escalar en [0,1]
-                p = F.layer_norm(prev_cls, (prev_cls.shape[-1],), eps=1e-6)  # (B,1,D_i)
-                s = F.layer_norm(seed,     (seed.shape[-1],),     eps=1e-6)
+                g = 0.05 + 0.9 * g  # g ∈ [0.05, 0.95] para evitar extremos exactos
+                p = F.layer_norm(prev_cls, (prev_cls.shape[-1],), eps=1e-5)  # (B,1,D_i)
+                s = F.layer_norm(seed,     (seed.shape[-1],),     eps=1e-5)
                 stage_cls_in = g * p + (1 - g) * s                # (B,1,D_i)
 
             # forward del stage pidiendo pre_cls
